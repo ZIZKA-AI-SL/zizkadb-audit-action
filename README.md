@@ -66,13 +66,64 @@ jobs:
           api-key: ${{ secrets.ZIZKADB_API_KEY }}
 ```
 
+## Catch a full rewrite: anchor each audit to the last one
+
+A hash chain proves the history is consistent **with itself**. Someone with write access to the database could still rebuild the whole chain, every checksum and link recomputed, and a plain check would pass. The fix is a fixed point outside the database: the chain head of the last audit.
+
+Every audit writes `chain-heads.json` (each agent's newest link, attested with the report). Pass the last one back as `anchor`, and each agent is checked **from its stored head**:
+
+- a rewrite of anything up to that head fails with `anchor_mismatch`, even when the new chain is consistent;
+- an agent whose whole history disappeared fails with `agent_missing`;
+- only the events since the last audit are walked, so a weekly audit stays fast as the history grows;
+- a broken agent keeps its old head in the new file, so a break is reported again next time, never trusted as the new starting point.
+
+Store the heads where the database writer cannot reach them. Git works well: every change is a reviewed, attributed commit, and the attestation proves each heads file came from this workflow.
+
+```yaml
+on:
+  schedule: [{ cron: "0 6 * * 1" }]   # every Monday
+  workflow_dispatch:
+permissions:
+  contents: write        # commit the new heads
+  id-token: write        # attestation
+  attestations: write    # attestation
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Trust the stored heads only if this repository's audit workflow produced them.
+      - name: Verify the stored heads
+        if: hashFiles('.zizkadb/chain-heads.json') != ''
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh attestation verify .zizkadb/chain-heads.json -R "$GITHUB_REPOSITORY"
+      - id: audit
+        uses: ZIZKA-AI-SL/zizkadb-audit-action@v1
+        with:
+          host: https://zizkadb.example.com
+          api-key: ${{ secrets.ZIZKADB_API_KEY }}
+          anchor: .zizkadb/chain-heads.json      # missing on the first run: that run starts the anchor
+      - name: Store the new heads
+        if: always() && steps.audit.outputs.chain-heads != ''
+        run: |
+          mkdir -p .zizkadb && cp "${{ steps.audit.outputs.chain-heads }}" .zizkadb/chain-heads.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .zizkadb/chain-heads.json
+          git commit -m "ZizkaDB audit: chain heads of run ${{ github.run_id }}" || exit 0
+          git push
+```
+
+An earlier `report.json` works as `anchor` too.
+
 ## What the report contains
 
 - Repository, commit, workflow run and ZizkaDB version
 - Per agent: result, events, deletions (tombstones), breaks, checksum mismatches, first and last event
 - The problems found, in plain language, with event numbers
 - The exported history files and their SHA-256
-- Each agent's chain head (`report.json`), to store outside ZizkaDB and check later runs against
+- Where each agent was checked from: its first event, or a stored chain head (`anchor`)
+- Each agent's chain head (`report.json` and `chain-heads.json`), to store outside ZizkaDB and pass back as `anchor`
 - What the evidence supports: automatic recording of events with timestamps (EU AI Act Article 12 record-keeping), traceability of each decision to its cause, and integrity of the record
 
 ## Inputs
@@ -83,6 +134,7 @@ jobs:
 | `host` | | Audit an existing ZizkaDB instead of a local one. |
 | `api-key` | | API key for `host`; pass it from a secret. |
 | `agents` | all | Comma-separated agent names to audit. |
+| `anchor` | | Path to the chain heads of an earlier audit (`chain-heads.json` or `report.json`). Each agent is checked from its stored head; a missing file is a first run. |
 | `fail-on-broken` | `true` | Fail the step when a hash chain is broken. |
 | `attest` | `true` | Attest the report and history (needs `id-token: write`, `attestations: write`). |
 | `comment` | `true` | Post and update a PR comment (needs `pull-requests: write`). |
@@ -99,6 +151,8 @@ jobs:
 | `events` | Events verified |
 | `report` | Path of `report.md` |
 | `artifact-name` | Name of the uploaded audit artifact |
+| `chain-heads` | Path of `chain-heads.json`: the anchor for the next audit |
+| `anchored` | Agents checked from a stored chain head |
 | `command-exit-code` | Exit code of `run` |
 
 ## Good to know

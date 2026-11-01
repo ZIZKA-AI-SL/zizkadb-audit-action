@@ -22,6 +22,13 @@ inputs:
     description: Comma-separated agent names to audit. Default all.
     required: false
     default: ""
+  anchor:
+    description: >-
+      Path to the chain heads of an earlier audit (`chain-heads.json` from this action, or its `report.json`).
+      Each agent is then checked from its stored head, which proves nothing up to that head was rewritten,
+      even by someone who rebuilt the whole chain inside the database. A missing file is a first run.
+    required: false
+    default: ""
   fail-on-broken:
     description: Fail the step when a hash chain is broken.
     required: false
@@ -63,6 +70,12 @@ outputs:
   artifact-name:
     description: Name of the uploaded audit artifact.
     value: ${{ steps.audit.outputs.artifact-name }}
+  chain-heads:
+    description: Path of `chain-heads.json`, the anchor for the next audit (store it outside ZizkaDB).
+    value: ${{ steps.audit.outputs.chain-heads }}
+  anchored:
+    description: Number of agents checked from a stored chain head.
+    value: ${{ steps.audit.outputs.anchored }}
   command-exit-code:
     description: Exit code of `run`.
     value: ${{ steps.audit.outputs.command-exit-code }}
@@ -79,6 +92,7 @@ runs:
         INPUT_HOST: ${{ inputs.host }}
         INPUT_API_KEY: ${{ inputs.api-key }}
         INPUT_AGENTS: ${{ inputs.agents }}
+        INPUT_ANCHOR: ${{ inputs.anchor }}
         INPUT_FAIL_ON_BROKEN: ${{ inputs.fail-on-broken }}
         INPUT_COMMENT: ${{ inputs.comment }}
         INPUT_IMAGE: ${{ inputs.image }}
@@ -95,6 +109,7 @@ runs:
         subject-path: |
           zizkadb-audit/report.md
           zizkadb-audit/report.json
+          zizkadb-audit/chain-heads.json
           zizkadb-audit/history/*.ndjson
 
     - if: always() && steps.attest.outcome == 'failure'
