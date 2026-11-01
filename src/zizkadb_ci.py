@@ -163,8 +163,11 @@ class Api:
     def why(self, event_id: str, depth: int = 25) -> dict:
         return self._req("GET", f"/v1/events/{event_id}/why", {"depth": depth})
 
-    def chain(self, agent: str) -> dict:
-        return self._req("GET", "/v1/events/chain", {"agent": agent})
+    def chain(self, agent: str, after_seq: int | None = None, anchor: str | None = None) -> dict:
+        """Hash-chain check. With ``after_seq`` + ``anchor`` (a stored chain head) it
+        resumes from that head and proves nothing before it was rewritten."""
+        return self._req("GET", "/v1/events/chain",
+                         {"agent": agent, "after_seq": after_seq, "anchor": anchor})
 
     def export(self, agent: str) -> bytes:
         return self._req("GET", "/v1/events/export", {"agent": agent}, raw=True)

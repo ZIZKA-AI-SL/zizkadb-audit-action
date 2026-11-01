@@ -12,6 +12,55 @@ import zizkadb_ci as z
 
 MARKER = "<!-- zizkadb-audit-action -->"
 OUT_DIR = "zizkadb-audit"
+HEADS_FILE = "chain-heads.json"
+HEADS_VERSION = 1
+HEX = set("0123456789abcdef")
+
+
+def _head(value) -> dict | None:
+    """A stored chain head as {sequence_no, chain_hash}, or None if it is not one."""
+    if not isinstance(value, dict):
+        return None
+    seq, link = value.get("sequence_no"), value.get("chain_hash")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+        return None
+    if not isinstance(link, str) or len(link) != 64 or not set(link.lower()) <= HEX:
+        return None
+    return {"sequence_no": seq, "chain_hash": link.lower()}
+
+
+def load_anchors(path: str) -> tuple[dict[str, dict], str]:
+    """Stored chain heads per agent, read from `chain-heads.json` (written by this
+    action) or from an earlier `report.json`.
+
+    Returns ({agent: head}, note). A missing file is a first run, not an error:
+    the audit runs unanchored and writes the heads the next run starts from.
+    A file that exists but cannot be read stops the audit, so a damaged or
+    swapped anchor never turns into a silent unanchored pass."""
+    if not path:
+        return {}, ""
+    if not os.path.exists(path):
+        return {}, f"No stored chain heads at `{path}` yet: this run is the first one, and its heads are the anchor for the next run."
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"`anchor` file `{path}` is not valid JSON: {e}")
+    agents = data.get("agents") if isinstance(data, dict) else None
+    heads: dict[str, dict] = {}
+    if isinstance(agents, dict):                      # chain-heads.json
+        items = agents.items()
+    elif isinstance(agents, list):                    # report.json of an earlier run
+        items = ((a.get("agent"), a.get("chain_head")) for a in agents if isinstance(a, dict))
+    else:
+        raise SystemExit(f"`anchor` file `{path}` has no `agents`: pass a chain-heads.json or report.json from an earlier audit.")
+    for agent, value in items:
+        head = _head(value)
+        if isinstance(agent, str) and agent and head:
+            heads[agent] = head
+    if not heads:
+        raise SystemExit(f"`anchor` file `{path}` holds no valid chain head (sequence_no + 64-hex chain_hash).")
+    return heads, f"Anchored to {len(heads)} stored chain head{'s' if len(heads) != 1 else ''} from `{path}`."
 
 
 def run_url() -> str:
@@ -42,8 +91,11 @@ def time_range(path: str) -> tuple[str, str, int]:
     return first, last, count
 
 
-def audit_agent(api: z.Api, agent: str) -> dict:
-    chain = api.chain(agent)
+def audit_agent(api: z.Api, agent: str, anchor: dict | None = None) -> dict:
+    if anchor:
+        chain = api.chain(agent, after_seq=anchor["sequence_no"], anchor=anchor["chain_hash"])
+    else:
+        chain = api.chain(agent)
     summary = chain.get("summary") or {}
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in agent)
     export = os.path.join(OUT_DIR, "history", f"{safe}.ndjson")
@@ -62,12 +114,37 @@ def audit_agent(api: z.Api, agent: str) -> dict:
         "checksum_mismatches": summary.get("checksum_mismatch", 0),
         "problems": (chain.get("problems") or [])[:20],
         "chain_head": chain.get("chain_head"),
+        "anchored_from": anchor,
         "first_event": first,
         "last_event": last,
         "export_file": os.path.relpath(export, OUT_DIR),
         "export_sha256": sha256(export),
         "exported_events": exported,
     }
+
+
+def missing_agent(agent: str, anchor: dict) -> dict:
+    """An agent with a stored head is gone: its whole history was deleted
+    (or renamed) since the anchor was written."""
+    return {
+        "agent": agent, "intact": False, "events": 0, "chained": 0, "deletions": 0,
+        "erasure_receipts": 0, "breaks": 1, "checksum_mismatches": 0,
+        "problems": [{"sequence_no": anchor["sequence_no"], "problem": "agent_missing"}],
+        "chain_head": None, "anchored_from": anchor, "first_event": "", "last_event": "",
+        "export_file": "", "export_sha256": "", "exported_events": 0,
+    }
+
+
+def next_heads(results: list[dict], anchors: dict[str, dict]) -> dict[str, dict]:
+    """The heads the next run starts from. An intact agent moves its head
+    forward; a broken one keeps its stored head, so a break is reported again
+    next time instead of becoming the new trusted starting point."""
+    heads = dict(anchors)
+    for r in results:
+        head = _head(r.get("chain_head"))
+        if r["intact"] and head:
+            heads[r["agent"]] = head
+    return dict(sorted(heads.items()))
 
 
 PROBLEMS = {
@@ -78,6 +155,7 @@ PROBLEMS = {
     "head_mismatch": "the newest recorded link is missing: recent events were removed",
     "tombstone_missing_checksum": "deletion record is incomplete",
     "unchained_after_chain_start": "event added outside the chain",
+    "agent_missing": "the agent and its history are gone since the stored chain head",
 }
 
 
@@ -105,14 +183,16 @@ def report_markdown(results: list[dict], meta: dict) -> str:
         f"| ZizkaDB | `{meta['zizkadb']}` |",
         f"| Agents | {len(results)} |\n",
         "## Hash-chain verification\n",
-        "| Agent | Result | Events | Deletions (tombstones) | Breaks | Checksum mismatches | First event | Last event |",
-        "|---|---|---|---|---|---|---|---|",
+        "| Agent | Result | Checked from | Events | Deletions (tombstones) | Breaks | Checksum mismatches | First event | Last event |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         lines.append(
-            f"| `{r['agent']}` | {'✅ intact' if r['intact'] else '❌ broken'} | {r['events']} | "
+            f"| `{r['agent']}` | {'✅ intact' if r['intact'] else '❌ broken'} | {anchor_label(r)} | {r['events']} | "
             f"{r['deletions']} | {r['breaks']} | {r['checksum_mismatches']} | "
             f"{r['first_event'][:19] or '-'} | {r['last_event'][:19] or '-'} |")
+    if meta.get("anchor_note"):
+        lines.append(f"\n{meta['anchor_note']}")
     broken = [r for r in results if not r["intact"]]
     if broken:
         lines.append("\n## Problems found\n")
@@ -126,10 +206,14 @@ def report_markdown(results: list[dict], meta: dict) -> str:
         "| File | Events | SHA-256 |", "|---|---|---|",
     ]
     for r in results:
-        lines.append(f"| `{r['export_file']}` | {r['exported_events']} | `{r['export_sha256']}` |")
+        if r["export_file"]:
+            lines.append(f"| `{r['export_file']}` | {r['exported_events']} | `{r['export_sha256']}` |")
     lines += [
-        "\nEach agent's chain head (`chain_head` in `report.json`) can be stored outside "
-        "ZizkaDB; a later check from that head proves nothing before it was rewritten.\n",
+        f"\n## Chain heads for the next audit\n\n`{HEADS_FILE}` holds each agent's newest link. "
+        "Store it outside ZizkaDB (for example committed to this repository) and pass it as `anchor` "
+        "next time: the next audit then proves that nothing up to these heads was rewritten, "
+        "even by someone who rebuilt the whole chain inside the database. A broken agent keeps "
+        "its old head, so the break is not trusted later.\n",
         "## What this evidence supports\n",
         "- **Automatic recording of events** over the agent's operation, with timestamps "
         "(EU AI Act Article 12 record-keeping).",
@@ -141,15 +225,24 @@ def report_markdown(results: list[dict], meta: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def summary_markdown(results: list[dict]) -> str:
+def anchor_label(r: dict) -> str:
+    a = r.get("anchored_from")
+    return f"🔗 stored head #{a['sequence_no']}" if a else "first event (no anchor)"
+
+
+def summary_markdown(results: list[dict], anchor_note: str = "") -> str:
     ok = all(r["intact"] for r in results)
     rows = "\n".join(
-        f"| `{r['agent']}` | {'✅ intact' if r['intact'] else '❌ broken'} | {r['events']} | {r['deletions']} | {r['breaks']} |"
+        f"| `{r['agent']}` | {'✅ intact' if r['intact'] else '❌ broken'} | {anchor_label(r)} | {r['events']} | {r['deletions']} | {r['breaks']} |"
         for r in results)
+    problems = [f"- `{r['agent']}`: {describe_problem(p)}" for r in results if not r["intact"] for p in r["problems"][:5]]
     return (
         f"### ZizkaDB Audit: {'✅ agent history intact' if ok else '❌ agent history changed or incomplete'}\n\n"
-        "| Agent | Hash chain | Events | Deletions | Breaks |\n|---|---|---|---|---|\n"
+        "| Agent | Hash chain | Checked from | Events | Deletions | Breaks |\n|---|---|---|---|---|---|\n"
         f"{rows}\n\n"
+        + ("\n".join(problems) + "\n\n" if problems else "")
+        + (f"{anchor_note}\n\n" if anchor_note else "")
+        + 
         "The full report, `report.json` and the exported history are in the **`zizkadb-audit`** artifact"
         f" of this run{', with a GitHub attestation on the report' if z.truthy('INPUT_ATTEST') else ''}.\n"
         f"<sub>How the hash chain works: [ZizkaDB security docs]({z.REPO_URL}/blob/main/docs/security/assessment.md)</sub>\n"
@@ -175,6 +268,7 @@ def main() -> int:
     zenv = {"ZIZKADB_HOST": host, "ZIZKADB_API_KEY": key}
     z.export_env(zenv)
 
+    anchors, anchor_note = load_anchors(z.env("INPUT_ANCHOR"))
     exit_code, output = (z.run_command(command, zenv) if command else (0, ""))
     api = z.Api(host, key)
     try:
@@ -182,7 +276,9 @@ def main() -> int:
         wanted = [a.strip() for a in z.env("INPUT_AGENTS").split(",") if a.strip()]
         if wanted:
             agents = [a for a in agents if a in wanted]
-        results = [audit_agent(api, a) for a in agents]
+        results = [audit_agent(api, a, anchors.get(a)) for a in agents]
+        results += [missing_agent(a, h) for a, h in sorted(anchors.items())
+                    if a not in agents and (not wanted or a in wanted)]
     except (urllib.error.URLError, OSError) as e:
         z.write_summary(f"### ZizkaDB Audit\n\nCould not read from ZizkaDB at `{host}`: {e}\n\n{z.FOOTER}")
         return exit_code or 1
@@ -203,14 +299,20 @@ def main() -> int:
         "commit": z.env("GITHUB_SHA"),
         "run_url": run_url(),
         "zizkadb": zizkadb,
+        "anchor_note": anchor_note,
     }
     with open(os.path.join(OUT_DIR, "report.md"), "w", encoding="utf-8") as f:
         f.write(report_markdown(results, meta))
     with open(os.path.join(OUT_DIR, "report.json"), "w", encoding="utf-8") as f:
         json.dump({**meta, "intact": all(r["intact"] for r in results), "agents": results}, f, indent=2)
+    heads = next_heads(results, anchors)
+    with open(os.path.join(OUT_DIR, HEADS_FILE), "w", encoding="utf-8") as f:
+        json.dump({"version": HEADS_VERSION, **{k: meta[k] for k in ("generated_at", "repository", "commit", "run_url")},
+                   "agents": heads}, f, indent=2)
+        f.write("\n")
     z.save_history(api, [], os.path.join(OUT_DIR, "history"))  # import helper next to the files
 
-    summary = summary_markdown(results)
+    summary = summary_markdown(results, anchor_note)
     if z.agent_limit_hit(output):
         summary += "\n" + z.agent_limit_markdown()
     artifact = z.artifact_name("zizkadb-audit")
@@ -226,6 +328,8 @@ def main() -> int:
     z.set_output("events", str(sum(r["events"] for r in results)))
     z.set_output("report", os.path.join(OUT_DIR, "report.md"))
     z.set_output("artifact-name", artifact)
+    z.set_output("chain-heads", os.path.join(OUT_DIR, HEADS_FILE))
+    z.set_output("anchored", str(sum(1 for r in results if r.get("anchored_from"))))
     z.set_output("command-exit-code", str(exit_code))
     if exit_code:
         return exit_code
